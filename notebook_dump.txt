@@ -1,0 +1,433 @@
+import re
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+import spacy
+
+nlp = spacy.load("en_core_web_lg")
+
+---CELL---
+
+# loading the data
+data = pd.read_csv("dataset/mtsamples.csv")
+data = data.dropna(subset=["transcription"])
+data
+
+---CELL---
+
+# --- EXTENDED DATA PURIFICATION: FIXING ALL GROUND TRUTH CROSSTALK ---
+print(f"Initial Dataset Size: {len(data)}")
+
+# 1. Locate mislabeled Surgery entries that are actually Orthopedic
+surg_mask = data['medical_specialty'].str.strip() == 'Surgery'
+
+ortho_keywords = ['bone', 'joint', 'knee', 'hip', 'shoulder', 'spine', 'bunion', 
+                  'fracture', 'ligament', 'tendon', 'arthroscopy', 'osteotomy', 
+                  'carpal', 'achilles', 'tibia', 'femur', 'cartilage']
+ortho_pattern = '|'.join(ortho_keywords)
+
+is_ortho_leaning = data['keywords'].fillna('').str.lower().str.contains(ortho_pattern) | \
+                   data['description'].fillna('').str.lower().str.contains(ortho_pattern)
+
+# 2. Locate mislabeled Surgery entries that are actually Cardiovascular
+cardio_keywords = ['heart', 'coronary', 'valve', 'aorta', 'pulmonary', 'bypass', 'cabg', 'cardiac', 'artery', 'vein', 'vascular']
+cardio_pattern = '|'.join(cardio_keywords)
+
+is_cardio_leaning = data['keywords'].fillna('').str.lower().str.contains(cardio_pattern) | \
+                    data['description'].fillna('').str.lower().str.contains(cardio_pattern)
+
+# 3. Locate mislabeled Orthopedic entries that are actually Neurology (Spine Surgeries)
+ortho_mask = data['medical_specialty'].str.strip() == 'Orthopedic'
+
+neuro_keywords = ['nerve', 'brain', 'spine', 'spinal', 'laminectomy', 'disc', 'cord', 'neuropathy', 'radiculopathy', 'cervical', 'lumbar', 'epidural']
+neuro_pattern = '|'.join(neuro_keywords)
+
+is_neuro_leaning = data['keywords'].fillna('').str.lower().str.contains(neuro_pattern) | \
+                   data['description'].fillna('').str.lower().str.contains(neuro_pattern)
+
+# Combine all dropping masks into a master drop index
+bad_surg_ortho_idx = data[surg_mask & is_ortho_leaning].index
+bad_surg_cardio_idx = data[surg_mask & is_cardio_leaning].index
+bad_ortho_neuro_idx = data[ortho_mask & is_neuro_leaning].index
+
+print(f"Dropping {len(bad_surg_ortho_idx)} orthopedic cases masquerading as Surgery.")
+print(f"Dropping {len(bad_surg_cardio_idx)} cardiovascular cases masquerading as Surgery.")
+print(f"Dropping {len(bad_ortho_neuro_idx)} neurological/spine cases masquerading as Orthopedic.")
+
+all_mislabeled_idx = bad_surg_ortho_idx.union(bad_surg_cardio_idx).union(bad_ortho_neuro_idx)
+data = data.drop(all_mislabeled_idx).reset_index(drop=True)
+print(f"Purified Dataset Size: {len(data)}")
+
+
+---CELL---
+
+# PRE PROCessing
+
+ABBREVIATIONS = {
+    "pt": "patient",
+    "hx": "history",
+    "dx": "diagnosis",
+    "tx": "treatment",
+    "sx": "symptoms",
+    "htn": "hypertension",
+    "cp": "chest pain",
+    "sob": "shortness of breath"
+}
+
+def extract_headers(text):
+    # extract from raw (uppercase) text before any lowercasing
+    headers = re.findall(r'\b([A-Z][A-Z\s]{3,}):', text)
+    return " ".join(h.strip().replace(" ", "_") for h in headers)
+
+def expand_abbreviations(text, abbr_dict):
+    for abbr, full in abbr_dict.items():
+        pattern = r'\b' + re.escape(abbr) + r'\b'
+        # append expansion alongside original token — never discard original
+        text = re.sub(pattern, lambda m: m.group() + " " + full, text)
+    return text
+
+def clean_symbols(text):
+    text = re.sub(r'[^a-zA-Z0-9\s.,]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def preprocess(text):
+    # used for the spacy NLP pass only (entity/negation extraction)
+    text = text.lower()
+    text = expand_abbreviations(text, ABBREVIATIONS)
+    text = clean_symbols(text)
+    return text
+
+---CELL---
+
+GENERIC_TERMS = {
+    "patient", "history", "exam", "examination", "procedure",
+    "doctor", "report", "mg", "day", "right", "left", "time",
+    "date", "pain", "incision", "anesthesia", "blood", "pressure",
+    "status", "room", "hospital", "discharge"
+}
+
+def extract_entities(doc):
+    entities = []
+    for chunk in doc.noun_chunks:
+        phrase = chunk.text.lower().strip()
+        if phrase in GENERIC_TERMS:
+            continue
+        if chunk.root.pos_ == "NOUN":
+            entities.append({
+                "entity": phrase,
+                "root": chunk.root,
+                "status": "present"
+            })
+    return entities
+
+
+---CELL---
+
+NEGATION_CUES = {
+    "no", "not", "denies", "without", "negative", "clear", "absent", "resolved", "free"
+}
+
+def detect_negation(entities):
+    for entity in entities:
+        root = entity["root"]
+        # check ancestor verbs
+        for ancestor in root.ancestors:
+            if ancestor.lemma_.lower() in NEGATION_CUES:
+                entity["status"] = "negated"
+        # check children
+        for child in root.children:
+            if child.dep_ == "neg" or child.lemma_.lower() in NEGATION_CUES:
+                entity["status"] = "negated"
+        # robust window checking (3 tokens before)
+        for tok in root.doc[max(0, root.i - 3):root.i]:
+            if tok.lemma_.lower() in NEGATION_CUES:
+                entity["status"] = "negated"
+    return entities
+
+
+---CELL---
+
+def process_document(text):
+    if not isinstance(text, str):
+        return ""
+    headers = extract_headers(text)      # extract from raw before lowercasing
+    cleaned = preprocess(text)
+    doc = nlp(cleaned)
+
+    entities = extract_entities(doc)
+    entities = detect_negation(entities)
+
+    entity_list = [e["entity"] for e in entities]
+    negated_list = [e["entity"] for e in entities if e["status"] == "negated"]
+
+    return cleaned, entity_list, negated_list, headers
+
+---CELL---
+
+# data filter: target specific specialties to improve accuracy and avoid generic overlaps
+target_specialties = [' Surgery', ' Cardiovascular / Pulmonary', ' Orthopedic', ' Neurology']
+data = data[data['medical_specialty'].isin(target_specialties)]
+
+
+print("Remaining rows:", len(data))
+
+
+---CELL---
+
+# --- ADDED FOR DATA BALANCING ---
+# 1. Find the size of the smallest class
+min_class_size = data['medical_specialty'].value_counts().min()
+
+# 2. Undersample all classes to explicitly match the minority class
+data = data.groupby('medical_specialty').sample(n=int(min_class_size), random_state=42).reset_index(drop=True)
+
+print("Balanced Data Distribution:")
+print(data['medical_specialty'].value_counts())
+print("Total Samples:", len(data))
+
+
+---CELL---
+
+data[["clean_text", "entities", "negated_entities", "headers"]] = data["transcription"].apply(process_document).apply(pd.Series)
+
+---CELL---
+
+SPECIALTY_WORDS = {
+    'hernia', 'tumor', 'resection', 'margins', 'fascia', 'tissue', 'laparoscopic',
+    'coronary', 'artery', 'aortic', 'ventricular', 'atrial', 'valve', 'myocardial', 'stenosis',
+    'fracture', 'joint', 'femur', 'tendon', 'bone', 'knee', 'shoulder', 'ligament',
+    'brain', 'seizure', 'temporal', 'nerve', 'spinal', 'cerebral', 'stroke'
+}
+
+def combine_features(row):
+    raw = str(row["transcription"])       # start from raw
+    headers = str(row["headers"])         # boosted header tokens
+    if isinstance(row["negated_entities"], list):
+        negated = " ".join(["NEG_" + e.replace(" ", "_") for e in row["negated_entities"]])
+    else:
+        negated = ""
+    
+    # boost specific words to give them higher priority
+    boosted = " ".join([word for word in raw.split() if word.lower() in SPECIALTY_WORDS])
+    # Repeating boosted words gives them higher TF weight
+    return raw + " " + headers + " " + negated + " " + (boosted + " ") * 3
+
+data["combined_text"] = data.apply(combine_features, axis=1)
+
+
+---CELL---
+
+texts = data["combined_text"]
+labels = data["medical_specialty"]
+
+---CELL---
+
+from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
+
+print("Identifying class-agnostic words to ignore...")
+
+# 1. Get raw word counts across the dataset
+temp_vectorizer = CountVectorizer(stop_words='english', min_df=5)
+X_counts = temp_vectorizer.fit_transform(texts)
+words = temp_vectorizer.get_feature_names_out()
+
+class_word_freq = []
+unique_classes = labels.unique()
+
+# 2. Get the distribution of each word per class
+class_doc_counts = []
+for cls in unique_classes:
+    class_docs = X_counts[(labels == cls).values]
+    # Sum word frequencies within this class
+    class_word_freq.append(np.array(class_docs.sum(axis=0)).flatten())
+    class_doc_counts.append((labels == cls).sum())
+
+class_freq_matrix = np.array(class_word_freq) # Shape: (Num_classes, Num_words)
+class_doc_counts_arr = np.array(class_doc_counts).reshape(-1, 1)
+
+# 3. Normalize to Relative Frequency (occurrences per document within the class)
+freq_per_doc_in_class = class_freq_matrix / class_doc_counts_arr
+
+# 4. Calculate Coefficient of Variation (CoV)
+# A low variation means it appears at roughly the same per-document rate in every class.
+word_mean = np.mean(freq_per_doc_in_class, axis=0)
+word_std = np.std(freq_per_doc_in_class, axis=0)
+cov = word_std / (word_mean + 1e-9)
+
+# 5. Extract words with lowest variation across classes
+# The 20th percentile of variation becomes our threshold
+threshold = np.percentile(cov, 20)
+dynamic_stopwords = [words[i] for i in range(len(words)) if cov[i] <= threshold]
+
+print(f"Identified {len(dynamic_stopwords)} common/class-agnostic words.")
+print("Examples of ignored words:", dynamic_stopwords[:30])
+
+# --- PAIRWISE FILTER ADDITION ---
+# 6. Identify pairwise overlap specifically between Surgery and Orthopedic
+surg_mask = unique_classes == ' Surgery'
+ortho_mask = unique_classes == ' Orthopedic'
+
+if surg_mask.any() and ortho_mask.any():
+    surg_idx = np.where(surg_mask)[0][0]
+    ortho_idx = np.where(ortho_mask)[0][0]
+    
+    surg_freq = freq_per_doc_in_class[surg_idx]
+    ortho_freq = freq_per_doc_in_class[ortho_idx]
+    
+    # Words common in both (> 0.2 average terms per doc)
+    common_mask = (surg_freq > 0.15) & (ortho_freq > 0.15)
+    
+    # Small relative difference meaning they co-occur equally between both specialties
+    rel_diff = np.abs(surg_freq - ortho_freq) / (surg_freq + ortho_freq + 1e-9)
+    overlap_mask = common_mask & (rel_diff < 0.3)
+    
+    pairwise_stopwords = [words[i] for i in range(len(words)) if overlap_mask[i]]
+    print(f"Identified {len(pairwise_stopwords)} overlapping words confounding Surgery and Orthopedic.")
+    print("Examples:", pairwise_stopwords[:30])
+else:
+    pairwise_stopwords = []
+    print("Couldn't find target classes for pairwise filtering.")
+
+# 7. Combine global and pairwise filters with English standard set
+custom_stopwords = list(ENGLISH_STOP_WORDS.union(dynamic_stopwords).union(pairwise_stopwords))
+
+
+---CELL---
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+vectorizer = TfidfVectorizer(
+    stop_words='english',
+    max_df=0.8,            # drop terms appearing in >50% docs to reduce generic noise
+    min_df = 5,
+    ngram_range=(1, 2),
+    sublinear_tf=True,     # log-scale TF, reduces dominance of repeated terms
+)
+
+X = vectorizer.fit_transform(texts)
+
+---CELL---
+
+from sklearn.model_selection import train_test_split
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    labels,
+    test_size=0.2,
+    random_state=42,
+    stratify=labels
+)
+
+---CELL---
+
+from sklearn.svm import SVC
+
+model = SVC(kernel='linear', C=1.0, random_state=42)
+
+model.fit(X_train, y_train)
+
+---CELL---
+
+from sklearn.metrics import accuracy_score, classification_report
+
+predictions = model.predict(X_test)
+
+print("Accuracy:", accuracy_score(y_test, predictions))
+print(classification_report(y_test, predictions))
+
+---CELL---
+
+data = data.reset_index(drop=True)
+
+print("Original Text:\n", data["transcription"][5])
+doc = nlp(preprocess(data["transcription"][5]))
+print(list(doc.sents))
+
+entities = extract_entities(doc)
+entities = detect_negation(entities)
+for entity in entities:
+    print(entity)
+
+from spacy import displacy
+displacy.render(next(doc.sents), style='dep', jupyter=True)
+
+
+
+---CELL---
+
+from wordcloud import WordCloud, STOPWORDS
+import matplotlib.pyplot as plt
+
+custom_stopwords = set(STOPWORDS).union({
+    'patient', 'hospital', 'procedure', 'history', 'mg', 'discharge',
+    'report', 'right', 'left', 'date', 'time', 'evaluation', 'diagnosis',
+    'medical', 'noted', 'performed', 'placed', 'day', 'dr', 'well',
+    'normal', 'status', 'room', 'exam', 'examination', 'blood', 'pressure'
+})
+
+def plot_wordcloud(text, title):
+    wordcloud = WordCloud(width=800, height=400, background_color='white', max_words=100, stopwords=custom_stopwords).generate(text)
+    plt.figure(figsize=(10, 5))
+    plt.imshow(wordcloud, interpolation='bilinear')
+    plt.axis("off")
+    plt.title(title, fontsize=16)
+    plt.show()
+
+for specialty in target_specialties:
+    text = " ".join(data[data["medical_specialty"] == specialty]["combined_text"])
+    plot_wordcloud(text, specialty)
+
+
+---CELL---
+
+from sklearn.svm import LinearSVC
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+import seaborn as sns
+
+# Train an Encoder model (Linear SVM acts as an encoding classifier over TF-IDF)
+clf = LinearSVC(dual=False, C=1.0, class_weight='balanced', random_state=42)
+clf.fit(X_train, y_train)
+y_pred = clf.predict(X_test)
+
+acc = accuracy_score(y_test, y_pred)
+print(f"Accuracy: {acc:.2f}")
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
+
+# Confusion Matrix visualization
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(10,8))
+sns.heatmap(cm, annot=True, fmt='d', xticklabels=clf.classes_, yticklabels=clf.classes_, cmap='Blues')
+plt.ylabel('Actual')
+plt.xlabel('Predicted')
+plt.title('Confusion Matrix')
+plt.show()
+
+
+---CELL---
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.manifold import TSNE
+
+# Reduce dimensionality using t-SNE
+tsne = TSNE(n_components=2, random_state=42)
+# X is the sparse TF-IDF matrix from earlier cells
+X_tsne = tsne.fit_transform(X.toarray())
+
+# Plot the results
+plt.figure(figsize=(12, 8))
+sns.scatterplot(
+    x=X_tsne[:, 0], 
+    y=X_tsne[:, 1], 
+    hue=labels, 
+    palette='Set2', 
+    alpha=0.7
+)
+plt.title('t-SNE Visualization of Medical Specialties')
+plt.xlabel('t-SNE Component 1')
+plt.ylabel('t-SNE Component 2')
+plt.legend(title='Specialty', bbox_to_anchor=(1.05, 1), loc='upper left')
+plt.tight_layout()
+plt.show()

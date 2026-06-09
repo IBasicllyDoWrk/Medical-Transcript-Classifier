@@ -5,12 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "cupy-cuda12x>=14.0.1",
+    "ipykernel>=7.2.0",
+    "matplotlib>=3.10.8",
     "nltk>=3.9.3",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
     "pip>=26.0.1",
     "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
     "setuptools>=82.0.0",
     "spacy>=3.8.11",
     "wheel>=0.46.3",
+    "wordcloud>=1.9.6",
 ]
