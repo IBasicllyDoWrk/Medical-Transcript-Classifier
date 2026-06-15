@@ -36,32 +36,33 @@ The classifier is trained to accurately differentiate between major clinical spe
    cd Medical-Transcript-Classifier
 
 2. **Create a virtual environment & activate it:**
-```Bash
+```bash
   python -m venv venv
   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+```
 
 3. **Install the required dependencies:**
-  '''Bash
+```bash
   pip install -r requirements.txt
 
 3. **Download the necessary NLP language models:**
-'''Bash
+```bash
   python -m spacy download en_core_web_sm
   python -m nltk.downloader punkt stopwords wordnet
-
+```
 ## 🖥️ Usage
 **Training the Model**
 To preprocess the medical dataset, extract features, and train the classifier, run:
 
-'''Bash
+```bash
   python train.py
-
+```
 **Running Inference**
 To classify a new evaluation transcript snippet, you can utilize the inference script:
 
-```Bash
+```bash
   python predict.py --text "Patient presents with acute epigastric pain radiating to the back, aggravated after meals."
-
+```
 Output Example:
 
 JSON
